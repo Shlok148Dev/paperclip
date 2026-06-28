@@ -1,0 +1,114 @@
+name: PR-Shepherd
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  pull_request_review:
+    types: [submitted]
+  check_suite:
+    types: [completed]
+  schedule:
+    - cron: '0 9 * * *' # Daily at 09:00 UTC
+
+jobs:
+  shepherd:
+    name: Shepherd PR
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      statuses: read
+      checks: read
+    if: |
+      github.event_name != 'schedule' && (
+        github.event_name != 'pull_request_review' || 
+        contains(fromJSON('["COLLABORATOR", "MEMBER", "OWNER"]'), github.event.review.author_association)
+      ) && (
+        github.event_name != 'check_suite' || 
+        github.event.check_suite.head_repository.full_name == github.repository
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out base branch (Secure Checkout)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Always run code from base branch, never execute PR-supplied workflow or python code directly.
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run Shepherd Engine
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_PROVIDER: "anthropic"
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          SHEPHERD_DRY_RUN: "false"
+          SHEPHERD_AUTO_MERGE: "true"
+          CHECK_SUITE_PRS: ${{ toJson(github.event.check_suite.pull_requests) }}
+          EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Resolve target PR number depending on the webhook event structure.
+          # All event data is read from environment variables to prevent shell injection.
+          PR_NUMBER=""
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            PR_NUMBER="$EVENT_PR_NUMBER"
+          elif [ "$GITHUB_EVENT_NAME" = "pull_request_review" ]; then
+            PR_NUMBER="$EVENT_PR_NUMBER"
+          elif [ "$GITHUB_EVENT_NAME" = "check_suite" ]; then
+            # Check suite contains pull_requests array — parse safely from env
+            PR_NUMBER=$(python3 -c "import os, json; prs = json.loads(os.environ.get('CHECK_SUITE_PRS', '[]')); print(prs[0]['number']) if prs else print('')")
+          fi
+
+          if [ -n "$PR_NUMBER" ]; then
+            if [ -f pr_shepherd/main.py ]; then
+              python pr_shepherd/main.py --pr-number "$PR_NUMBER"
+            else
+              echo "PR-Shepherd engine not found on the base branch yet (pre-merge). Skipping execution."
+            fi
+          else
+            echo "No active PR number associated with this event. Skipping."
+          fi
+
+  digest:
+    name: Generate Daily Summary
+    permissions:
+      issues: write
+      contents: read
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out base branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run Digest Engine
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          SHEPHERD_DRY_RUN: "false"
+        run: |
+          if [ -f pr_shepherd/main.py ]; then
+            python pr_shepherd/main.py --digest
+          else
+            echo "PR-Shepherd engine not found on base branch yet (pre-merge). Skipping digest generation."
+          fi
