@@ -1,0 +1,109 @@
+name: PR-Shepherd
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  pull_request_review:
+    types: [submitted]
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  check_suite:
+    types: [completed]
+  schedule:
+    - cron: '0 9 * * *' # Daily at 09:00 UTC
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  statuses: read
+  checks: read
+
+jobs:
+  shepherd:
+    name: Shepherd PR
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out base branch (Secure Checkout)
+        uses: actions/checkout@v4
+        with:
+          # Always run code from base branch, never execute PR-supplied workflow or python code directly.
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run Shepherd Engine
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_PROVIDER: "anthropic"
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          SHEPHERD_DRY_RUN: "false" # Run in non-dry-run mode when in production
+          SHEPHERD_AUTO_MERGE: "true"
+        run: |
+          # Resolve target PR number depending on the webhook event structure
+          PR_NUMBER=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+          elif [ "${{ github.event_name }}" = "pull_request_review" ]; then
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+          elif [ "${{ github.event_name }}" = "issue_comment" ]; then
+            # Issue comment event is triggered for both issues and PRs.
+            # Only process if this is actually a pull request comment.
+            if [ -n "${{ github.event.issue.pull_request }}" ]; then
+              PR_NUMBER="${{ github.event.issue.number }}"
+            fi
+          elif [ "${{ github.event_name }}" = "pull_request_review_comment" ]; then
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+          elif [ "${{ github.event_name }}" = "check_suite" ]; then
+            # Check suite contains pull_requests array
+            # Handle the first pull request associated
+            PR_NUMBER=$(echo '${{ toJson(github.event.check_suite.pull_requests) }}' | python3 -c "import sys, json; prs = json.load(sys.stdin); print(prs[0]['number']) if prs else print('')")
+          fi
+
+          if [ -n "$PR_NUMBER" ]; then
+            python pr_shepherd/main.py --pr-number "$PR_NUMBER"
+          else
+            echo "No active PR number associated with this event. Skipping."
+          fi
+
+  digest:
+    name: Generate Daily Summary
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run Digest Engine
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          SHEPHERD_DRY_RUN: "false"
+        run: |
+          python pr_shepherd/main.py --digest
